@@ -1,0 +1,67 @@
+# web.py
+from flask import Flask, request, render_template_string, abort
+import sqlite3, datetime, os
+
+DB_PATH = os.environ.get("DB_PATH", "tx.db")
+app = Flask(__name__)
+
+TEMPLATE = """
+<!doctype html>
+<title>Daily Report</title>
+<h3>Report for chat {{chat_id}} date {{date}}</h3>
+<p>Range: {{from_dt}} - {{to_dt}}</p>
+{% if rows %}
+  <h4>Transactions ({{rows|length}})</h4>
+  <table border=1 cellpadding=6>
+    <tr><th>Time</th><th>Type</th><th>INR</th><th>USD</th><th>User</th></tr>
+    {% for r in rows %}
+      <tr>
+        <td>{{ r[0][:19].replace('T',' ') }}</td>
+        <td>{{ r[4] }}</td>
+        <td>{{ "%.2f"|format(r[1]) }}</td>
+        <td>{{ "%.4f"|format(r[2]) }}</td>
+        <td>{{ r[3] }}</td>
+      </tr>
+    {% endfor %}
+  </table>
+  <h4>Totals</h4>
+  <p>Total INR: {{ total_inr }} | Total USD: {{ total_usd }}</p>
+{% else %}
+  <p>No transactions in this range.</p>
+{% endif %}
+"""
+
+def get_rows(chat_id, date_str):
+    try:
+        date = datetime.date.fromisoformat(date_str)
+    except Exception:
+        return None, None, None
+    # use day range 06:00 to next day 06:00 like your screenshot
+    from_dt = datetime.datetime.combine(date, datetime.time(hour=6))
+    to_dt = from_dt + datetime.timedelta(days=1)
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("""SELECT time_iso, amount_inr, amount_usd, user, type
+                   FROM transactions
+                   WHERE chat_id=? AND time_iso BETWEEN ? AND ?
+                   ORDER BY id ASC""", (chat_id, from_dt.isoformat(), to_dt.isoformat()))
+    rows = cur.fetchall()
+    con.close()
+    total_inr = sum(r[1] for r in rows)
+    total_usd = sum(r[2] for r in rows)
+    return rows, from_dt, to_dt, total_inr, total_usd
+
+@app.route("/report")
+def report():
+    chat_id = request.args.get("chat_id")
+    date = request.args.get("date")
+    if not chat_id or not date:
+        abort(400)
+    rows, from_dt, to_dt, total_inr, total_usd = get_rows(int(chat_id), date)
+    if rows is None:
+        abort(400)
+    return render_template_string(TEMPLATE, chat_id=chat_id, date=date, rows=rows,
+                                  from_dt=from_dt, to_dt=to_dt, total_inr=total_inr, total_usd=total_usd)
+
+if __name__=="__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
