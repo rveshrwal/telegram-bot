@@ -13,7 +13,7 @@ from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, Callb
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 # ====== CONFIG ======
-TOKEN = "8436563657:AAElU0tqKRSo-lUi_6JwbY-bmq94TxckT-8"   # <-- testing token (revoke after)
+TOKEN = "8436563657:AAFUs0u8kBXzQGS3C3H12Ejes8AEcXeRp5o"   # <-- testing token (revoke after)
 BASE_URL = os.environ.get("BASE_URL", "")  # optional web panel url
 LAST_N = int(os.environ.get("LAST_N", "5"))  # how many recent items to show in compact view
 DB_PATH = os.environ.get("DB_PATH", "tx.db")
@@ -409,3 +409,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
