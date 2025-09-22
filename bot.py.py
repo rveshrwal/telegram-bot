@@ -17,7 +17,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 # ====== CONFIG ======
 # Prefer environment variable. If not present, fallback to the example string (DO NOT use in production).
-TOKEN = os.environ.get("8436563657:AAFUs0u8kBXzQGS3C3H12Ejes8AEcXeRp5o")
+TOKEN = os.environ.get("8436563657:AAHlbt-p7EwLeTlNlW3mziinFRiUmt3Joxc")
 BASE_URL = os.environ.get("BASE_URL", "")
 LAST_N = int(os.environ.get("LAST_N", "5"))
 DB_PATH = os.environ.get("DB_PATH", "tx.db")
@@ -456,5 +456,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
