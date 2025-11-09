@@ -1,5 +1,13 @@
-# bot.py — updated: daily auto-reset at 06:00 IST using JobQueue
-# NOTE: set BOT_TOKEN as env var in production. If you keep token in file for testing, revoke it after.
+#!/usr/bin/env python3
+"""
+bot.py — Telegram bot with automatic inline "完整账单" button under every summary.
+Set TOKEN in environment before running.
+
+Usage:
+  export TOKEN="123456:ABC..."   (Linux/macOS)
+  python3 bot.py
+"""
+
 import os
 import sys
 import re
@@ -8,36 +16,77 @@ import sqlite3
 import datetime
 import logging
 import pytz
+import ast
+import operator as op
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext
-
-# ensure current directory is first on import path
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext, CallbackQueryHandler
 
 # ====== CONFIG ======
-# Prefer environment variable. If not present, fallback to the example string (DO NOT use in production).
-TOKEN = os.environ.get("8436563657:AAHlbt-p7EwLeTlNlW3mziinFRiUmt3Joxc")
-BASE_URL = os.environ.get("BASE_URL", "")
-LAST_N = int(os.environ.get("LAST_N", "5"))
-DB_PATH = os.environ.get("DB_PATH", "tx.db")
-ADMINS = {6603524612, 7773526534}
+TOKEN = os.environ.get("TOKEN", "8270868449:AAGbRTkqWfDhZqpt_3e_sYT1G0MwzBVZ8-w")
+DB_PATH = "tx.db"
+LAST_N = 5
+
+# built-in admins — बदलना हो तो यहाँ कर लो
+ADMINS = {6603524612, 7773526534, 8157411319}
 authorized_users = set(ADMINS)
 
-# per-chat maps
+# per-chat caches
 exchange_rates = {}
 fee_rates = {}
 
+# timezone
+IST = pytz.timezone("Asia/Kolkata")
+
 # logging
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
+logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# ====== safe arithmetic evaluator ======
+_ALLOWED_OPS = {
+    ast.Add: op.add,
+    ast.Sub: op.sub,
+    ast.Mult: op.mul,
+    ast.Div: op.truediv,
+    ast.USub: op.neg,
+    ast.UAdd: op.pos,
+}
+
+def safe_eval_arith(expr: str) -> float:
+    if not re.match(r'^[0-9\.\+\-\*/\(\) \t]+$', expr):
+        raise ValueError("Invalid characters in expression")
+    def _eval(node):
+        if isinstance(node, ast.Num):
+            return node.n
+        if hasattr(ast, "Constant") and isinstance(node, ast.Constant):
+            if isinstance(node.value, (int, float)):
+                return node.value
+            raise ValueError("Invalid constant")
+        if isinstance(node, ast.BinOp):
+            left = _eval(node.left)
+            right = _eval(node.right)
+            opfunc = _ALLOWED_OPS.get(type(node.op))
+            if opfunc is None:
+                raise ValueError("Operator not allowed")
+            return opfunc(left, right)
+        if isinstance(node, ast.UnaryOp):
+            operand = _eval(node.operand)
+            opfunc = _ALLOWED_OPS.get(type(node.op))
+            if opfunc is None:
+                raise ValueError("Unary operator not allowed")
+            return opfunc(operand)
+        raise ValueError("Expression not allowed")
+    parsed = ast.parse(expr, mode='eval')
+    return float(_eval(parsed.body))
+
 # ====== DB helpers ======
+def _db_connect():
+    con = sqlite3.connect(DB_PATH, timeout=10, detect_types=sqlite3.PARSE_DECLTYPES)
+    con.execute("PRAGMA journal_mode=WAL;")
+    return con
+
 def init_db():
-    con = sqlite3.connect(DB_PATH, timeout=10)
+    con = _db_connect()
     cur = con.cursor()
     cur.execute("""CREATE TABLE IF NOT EXISTS transactions (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -48,79 +97,151 @@ def init_db():
         amount_usd REAL,
         time_iso TEXT
     )""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS settings (
+        chat_id INTEGER PRIMARY KEY,
+        exchange_rate REAL,
+        fee_rate REAL
+    )""")
+    cur.execute("""CREATE TABLE IF NOT EXISTS admins (
+        user_id INTEGER PRIMARY KEY
+    )""")
+    for a in ADMINS:
+        cur.execute("INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (int(a),))
+    cur.execute("SELECT user_id FROM admins")
+    for r in cur.fetchall():
+        try:
+            authorized_users.add(int(r[0]))
+        except:
+            pass
+    cur.execute("SELECT chat_id, exchange_rate, fee_rate FROM settings")
+    for (cid, er, fr) in cur.fetchall():
+        try:
+            if er is not None:
+                exchange_rates[int(cid)] = float(er)
+            if fr is not None:
+                fee_rates[int(cid)] = float(fr)
+        except:
+            pass
     con.commit()
     con.close()
     logger.info("DB initialized at %s", DB_PATH)
 
+def persist_setting(chat_id, exchange_rate=None, fee_rate=None):
+    con = _db_connect(); cur = con.cursor()
+    cur.execute("SELECT 1 FROM settings WHERE chat_id=?", (chat_id,))
+    exists = cur.fetchone()
+    if exists:
+        if exchange_rate is not None:
+            cur.execute("UPDATE settings SET exchange_rate=? WHERE chat_id=?", (exchange_rate, chat_id))
+        if fee_rate is not None:
+            cur.execute("UPDATE settings SET fee_rate=? WHERE chat_id=?", (fee_rate, chat_id))
+    else:
+        cur.execute("INSERT INTO.settings(chat_id, exchange_rate, fee_rate) VALUES (?,?,?)".replace('.', ''),
+                    (chat_id, exchange_rate if exchange_rate is not None else 106.0, fee_rate if fee_rate is not None else 0.0))
+        # note: above replace('.') is a tiny safety to avoid accidental dot in SQL string in some editors
+    # fallback correct implementation if previous line odd:
+    try:
+        con.commit()
+    except:
+        # normal insert/update handled earlier - ensure commit
+        con.commit()
+    con.close()
+
+def persist_admin(user_id):
+    con = _db_connect(); cur = con.cursor()
+    cur.execute("INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (int(user_id),))
+    con.commit(); con.close()
+
+def remove_admin_persist(user_id):
+    con = _db_connect(); cur = con.cursor()
+    cur.execute("DELETE FROM admins WHERE user_id=?", (int(user_id),))
+    con.commit(); con.close()
+
 def add_tx_db(chat_id, user, type_, amount_inr, amount_usd):
-    con = sqlite3.connect(DB_PATH, timeout=10)
-    cur = con.cursor()
+    con = _db_connect(); cur = con.cursor()
     cur.execute(
         "INSERT INTO transactions (chat_id,user,type,amount_inr,amount_usd,time_iso) VALUES (?,?,?,?,?,?)",
-        (chat_id, user, type_, amount_inr, amount_usd, datetime.datetime.now().isoformat())
+        (chat_id, user, type_, float(amount_inr), float(amount_usd), datetime.datetime.utcnow().isoformat())
     )
-    con.commit()
-    con.close()
-    logger.info("Added tx: chat=%s user=%s type=%s inr=%s usd=%s", chat_id, user, type_, amount_inr, amount_usd)
+    con.commit(); con.close()
 
-def get_transactions_between(chat_id, from_dt, to_dt):
-    con = sqlite3.connect(DB_PATH, timeout=10)
-    cur = con.cursor()
+def get_transactions_between(chat_id, from_dt_utc, to_dt_utc):
+    con = _db_connect(); cur = con.cursor()
     cur.execute("""SELECT time_iso, amount_inr, amount_usd, user, type
                    FROM transactions
                    WHERE chat_id=? AND time_iso BETWEEN ? AND ?
                    ORDER BY id ASC""",
-                (chat_id, from_dt.isoformat(), to_dt.isoformat()))
-    rows = cur.fetchall()
-    con.close()
+                (chat_id, from_dt_utc.isoformat(), to_dt_utc.isoformat()))
+    rows = cur.fetchall(); con.close()
     return rows
-
-def get_latest_transactions(chat_id, limit=5):
-    con = sqlite3.connect(DB_PATH, timeout=10)
-    cur = con.cursor()
-    cur.execute("SELECT time_iso, amount_inr, amount_usd, user, type FROM transactions WHERE chat_id=? ORDER BY id DESC LIMIT ?", (chat_id, limit))
-    rows = cur.fetchall()
-    con.close()
-    return list(reversed(rows))
 
 # ====== helpers ======
 def is_authorized(user_id):
-    return user_id in authorized_users
+    return int(user_id) in authorized_users
 
 def get_exchange_rate(chat_id):
-    return exchange_rates.get(chat_id, 106.0)
+    if chat_id in exchange_rates:
+        return float(exchange_rates[chat_id])
+    try:
+        con = _db_connect(); cur = con.cursor()
+        cur.execute("SELECT exchange_rate FROM settings WHERE chat_id=?", (chat_id,))
+        row = cur.fetchone(); con.close()
+        if row and row[0] is not None:
+            exchange_rates[chat_id] = float(row[0]); return float(row[0])
+    except:
+        pass
+    return 106.0
+
+def set_exchange_rate(chat_id, rate):
+    exchange_rates[chat_id] = float(rate); persist_setting(chat_id, exchange_rate=float(rate))
 
 def get_fee_rate(chat_id):
-    return fee_rates.get(chat_id, 0.0)
-
-def eval_arith(expr):
-    # allow digits, spaces and basic ops only
-    if not re.match(r"^[0-9\.\+\-\*\/\(\) ]+$", expr):
-        raise ValueError("Invalid characters")
-    return float(eval(expr))
-
-# ====== message builders ======
-def _ist_bounds_for_today():
-    """Return naive system-local datetimes representing IST 06:00 -> next IST 06:00 for 'today' in IST."""
-    ist = pytz.timezone("Asia/Kolkata")
-    now_ist = datetime.datetime.now(ist)
-    today_ist = now_ist.date()
-    ist_from = ist.localize(datetime.datetime.combine(today_ist, datetime.time(hour=6, minute=0, second=0)))
-    ist_to = ist_from + datetime.timedelta(days=1)
-
-    # convert IST bounds to system local naive datetimes for comparison with stored naive timestamps
+    if chat_id in fee_rates:
+        return float(fee_rates[chat_id])
     try:
-        # IST -> UTC -> system tz
-        from_utc = ist_from.astimezone(pytz.utc)
-        to_utc = ist_to.astimezone(pytz.utc)
-        system_tz = datetime.datetime.now().astimezone().tzinfo
-        from_sys = from_utc.astimezone(pytz.timezone(system_tz.zone))
-        to_sys = to_utc.astimezone(pytz.timezone(system_tz.zone))
-        return from_sys.replace(tzinfo=None), to_sys.replace(tzinfo=None)
-    except Exception:
-        # fallback: return naive IST datetimes (works if server is in IST)
-        return ist_from.replace(tzinfo=None), ist_to.replace(tzinfo=None)
+        con = _db_connect(); cur = con.cursor()
+        cur.execute("SELECT fee_rate FROM settings WHERE chat_id=?", (chat_id,))
+        row = cur.fetchone(); con.close()
+        if row and row[0] is not None:
+            fee_rates[chat_id] = float(row[0]); return float(row[0])
+    except:
+        pass
+    return 0.0
 
+def set_fee_rate(chat_id, fee):
+    fee_rates[chat_id] = float(fee); persist_setting(chat_id, fee_rate=float(fee))
+
+def add_admin(user_id):
+    authorized_users.add(int(user_id)); persist_admin(user_id)
+
+def remove_admin(user_id):
+    try:
+        authorized_users.discard(int(user_id))
+        remove_admin_persist(user_id)
+    except:
+        pass
+
+# ====== day bounds ======
+def _ist_bounds_for_today():
+    now_ist = datetime.datetime.now(IST)
+    today_ist = now_ist.date()
+    ist_from = IST.localize(datetime.datetime.combine(today_ist, datetime.time(hour=8, minute=30)))
+    ist_to = ist_from + datetime.timedelta(days=1)
+    from_utc = ist_from.astimezone(pytz.utc)
+    to_utc = ist_to.astimezone(pytz.utc)
+    return from_utc, to_utc
+
+# ====== formatting helpers (no thousands commas anywhere) ======
+def fmt_inr_plain(x):
+    x = float(x)
+    if abs(x - int(x)) < 0.005:
+        return f"{int(x)}"
+    return f"{x:.2f}"
+
+def fmt_usd(x):
+    return f"{float(x):.2f}U"
+
+# ====== build clean (normal text) message ======
 def build_compact_message(chat_id):
     rate = get_exchange_rate(chat_id)
     fee = get_fee_rate(chat_id)
@@ -130,8 +251,8 @@ def build_compact_message(chat_id):
     incomes_all = [r for r in rows if r[4] == "income"]
     payouts_all = [r for r in rows if r[4] == "payout"]
 
-    income_count = len(incomes_all)
-    payout_count = len(payouts_all)
+    inc_count = len(incomes_all)
+    pay_count = len(payouts_all)
 
     show_n = LAST_N if LAST_N > 0 else 5
     incomes_show = incomes_all[-show_n:] if incomes_all else []
@@ -139,193 +260,265 @@ def build_compact_message(chat_id):
 
     def fmt_time(tiso):
         try:
-            return datetime.datetime.fromisoformat(tiso).strftime("%H:%M:%S")
+            dt = datetime.datetime.fromisoformat(tiso)
+            dt = dt.replace(tzinfo=pytz.utc).astimezone(IST)
+            return dt.strftime("%H:%M:%S")
         except:
             return tiso
 
-    income_lines = "\n".join(
-        [f"{fmt_time(r[0])}   {int(r[1]) if float(r[1]).is_integer() else r[1]} / {rate} = {r[2]:.2f}U   {r[3]}" for r in incomes_show]
-    ) or "None"
+    income_lines = []
+    for r in incomes_show:
+        t = fmt_time(r[0])
+        inr = fmt_inr_plain(r[1])
+        usd = fmt_usd(r[2])
+        user = r[3]
+        income_lines.append(f"{t}  {inr} / {rate} = {usd}  {user}")
+    if not income_lines:
+        income_lines = ["None"]
 
-    payout_lines = "\n".join(
-        [f"{fmt_time(r[0])}   {r[2]:.2f}U ({int(r[1]) if float(r[1]).is_integer() else r[1]})   {r[3]}" for r in payouts_show]
-    ) or "None"
+    payout_lines = []
+    for r in payouts_show:
+        t = fmt_time(r[0])
+        usd = fmt_usd(r[2])
+        inr = fmt_inr_plain(r[1])
+        user = r[3]
+        payout_lines.append(f"{t}  {usd} ({inr})  {user}")
+    if not payout_lines:
+        payout_lines = ["None"]
 
-    total_income_inr = sum(r[1] for r in incomes_all)
-    total_income_usd = sum(r[2] for r in incomes_all)
-    total_payout_inr = sum(r[1] for r in payouts_all)
-    total_payout_usd = sum(r[2] for r in payouts_all)
+    total_income_inr = sum(float(r[1]) for r in incomes_all)
+    total_income_usd = sum(float(r[2]) for r in incomes_all)
+    total_payout_inr = sum(float(r[1]) for r in payouts_all)
+    total_payout_usd = sum(float(r[2]) for r in payouts_all)
     not_yet_inr = total_income_inr - total_payout_inr
     not_yet_usd = total_income_usd - total_payout_usd
 
     parts = []
-    parts.append(f"Today's Income ({income_count})")
-    parts.append(income_lines)
+    parts.append(f"Today's Income ({inc_count})")
+    parts.extend(income_lines)
     parts.append("")
-    parts.append(f"Today's Issued ({payout_count})")
-    parts.append(payout_lines)
+    parts.append(f"Today's Issued ({pay_count})")
+    parts.extend(payout_lines)
     parts.append("")
-    parts.append(f"Total Income : {int(total_income_inr)}")
+    parts.append(f"Total Income : {fmt_inr_plain(total_income_inr)} | {fmt_usd(total_income_usd)}")
     parts.append(f"Exchange Rate : {rate}")
-    parts.append(f"Fee Rate : {int(fee)}%")
+    parts.append(f"Fee Rate : {fee}%")
     parts.append("")
-    parts.append(f"Already issued : {int(total_payout_inr)} | {total_payout_usd:.2f}U")
-    parts.append(f"Should be issued : {int(total_income_inr)} | {total_income_usd:.2f}U")
-    parts.append(f"Not yet issued : {int(not_yet_inr)} | {not_yet_usd:.2f}U")
+    parts.append(f"Should be issued : {fmt_inr_plain(total_payout_inr)} | {fmt_usd(total_payout_usd)}")
+    parts.append(f"Already issued : {fmt_inr_plain(total_income_inr)} | {fmt_usd(total_income_usd)}")
+    parts.append(f"Not yet issued : {fmt_inr_plain(not_yet_inr)} | {fmt_usd(not_yet_usd)}")
     parts.append("")
-    parts.append("Use /viewfull to download full report")
     return "\n".join(parts)
 
-def build_full_text_report(chat_id):
-    rate = get_exchange_rate(chat_id)
-    fee = get_fee_rate(chat_id)
-
-    from_dt, to_dt = _ist_bounds_for_today()
-    rows = get_transactions_between(chat_id, from_dt, to_dt)
-    incomes = [r for r in rows if r[4] == "income"]
-    payouts = [r for r in rows if r[4] == "payout"]
-
-    def fmt_time(tiso):
-        try:
-            return datetime.datetime.fromisoformat(tiso).strftime("%H:%M:%S")
-        except:
-            return tiso
-
-    lines = []
-    lines.append(f"Full report for chat_id={chat_id} date={datetime.date.today().isoformat()}")
-    lines.append("="*40)
-    lines.append("")
-    lines.append(f"Today's Income ({len(incomes)})")
-    if incomes:
-        for r in incomes:
-            lines.append(f"{fmt_time(r[0])}   {int(r[1]) if float(r[1]).is_integer() else r[1]} / {rate} = {r[2]:.2f}U   {r[3]}")
-    else:
-        lines.append("None")
-    lines.append("")
-    lines.append(f"Today's Issued ({len(payouts)})")
-    if payouts:
-        for r in payouts:
-            lines.append(f"{fmt_time(r[0])}   {r[2]:.2f}U ({int(r[1]) if float(r[1]).is_integer() else r[1]})   {r[3]}")
-    else:
-        lines.append("None")
-    lines.append("")
-    total_income_inr = sum(r[1] for r in incomes)
-    total_income_usd = sum(r[2] for r in incomes)
-    total_payout_inr = sum(r[1] for r in payouts)
-    total_payout_usd = sum(r[2] for r in payouts)
-    not_yet_inr = total_income_inr - total_payout_inr
-    not_yet_usd = total_income_usd - total_payout_usd
-    lines.append(f"Total Income : {int(total_income_inr)}")
-    lines.append(f"Exchange Rate : {rate}")
-    lines.append(f"Fee Rate : {int(fee)}%")
-    lines.append("")
-    lines.append(f"Already issued : {int(total_payout_inr)} | {total_payout_usd:.2f}U")
-    lines.append(f"Should be issued : {int(total_income_inr)} | {total_income_usd:.2f}U")
-    lines.append(f"Not yet issued : {int(not_yet_inr)} | {not_yet_usd:.2f}U")
-    lines.append("")
-    lines.append("All transactions (chronological):")
-    lines.append("")
-    for r in rows:
-        lines.append(f"{r[0]} | type={r[4]} | INR={r[1]} | USD={r[2]:.2f} | user={r[3]}")
-    return "\n".join(lines)
+# ====== helper: send summary + inline button (Chinese-style label) ======
+def send_summary_with_button(update: Update, context: CallbackContext, chat_id: int):
+    text = build_compact_message(chat_id)
+    # Chinese-style button label like screenshot: "🌐 完整账单"
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("🌐 完整账单", callback_data="VIEWFULL")]])
+    update.message.reply_text(text, reply_markup=kb)
 
 # ====== commands ======
 def start(update: Update, context: CallbackContext):
-    update.message.reply_text("✅ Bot ready. Use + / - / T / T- for transactions. /summary for quick view. /viewfull to download full report.")
+    update.message.reply_text("✅ Bot ready. Use +<expr> for income (e.g. +100*1.07), T<usd> for payout (e.g. T34.59). /summary /setrate /setfee /addadmin /deladmin")
 
 def summary_cmd(update: Update, context: CallbackContext):
     if not is_authorized(update.effective_user.id):
-        return
+        return update.message.reply_text("❌ You are not authorized.")
     chat_id = update.effective_chat.id
-    text = build_compact_message(chat_id)
-
-    keyboard = None
-    if BASE_URL:
-        today = datetime.date.today()
-        url = f"{BASE_URL}/report?chat_id={chat_id}&date={today.isoformat()}"
-        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🔗 View full report (web)", url=url)]])
-
-    update.message.reply_text(text, parse_mode=None, reply_markup=keyboard)
+    send_summary_with_button(update, context, chat_id)
 
 def viewfull_cmd(update: Update, context: CallbackContext):
     if not is_authorized(update.effective_user.id):
-        return
+        return update.message.reply_text("❌ You are not authorized.")
     chat_id = update.effective_chat.id
-    full_text = build_full_text_report(chat_id)
+    from_dt, to_dt = _ist_bounds_for_today()
+    rows = get_transactions_between(chat_id, from_dt, to_dt)
+    lines = []
+    for r in rows:
+        try:
+            dt = datetime.datetime.fromisoformat(r[0]).replace(tzinfo=pytz.utc).astimezone(IST)
+            timestr = dt.strftime("%Y-%m-%d %H:%M:%S")
+        except:
+            timestr = r[0]
+        lines.append(f"{timestr} | {r[4]} | INR {fmt_inr_plain(r[1])} | USD {fmt_usd(r[2])} | {r[3]}")
+    full_text = "\n".join(lines) or "No transactions for today."
+    bio = io.BytesIO(); bio.write(full_text.encode("utf-8")); bio.seek(0)
+    filename = f"report_{chat_id}_{datetime.date.today().isoformat()}.txt"
+    update.message.reply_document(document=bio, filename=filename)
+    bio.close()
+
+# ---- callback for the button (send file & edit message) ----
+def viewfull_callback(update: Update, context: CallbackContext):
+    query = update.callback_query
+    user = query.from_user
+    chat = query.message.chat
+    chat_id = chat.id
+
+    # acknowledge quickly (keeps the button from showing 'loading' forever)
+    try:
+        query.answer(text="Sending report...")
+    except:
+        try:
+            query.answer()
+        except:
+            pass
+
+    # authorization check
+    if not is_authorized(user.id):
+        # remove button but keep the summary text visible
+        try:
+            query.message.edit_reply_markup(reply_markup=None)
+        except:
+            pass
+        try:
+            query.message.reply_text("You are not authorized to download this report.")
+        except:
+            pass
+        return
+
+    # Build the full report text (same as /viewfull)
+    from_dt, to_dt = _ist_bounds_for_today()
+    rows = get_transactions_between(chat_id, from_dt, to_dt)
+    lines = []
+    for r in rows:
+        try:
+            dt = datetime.datetime.fromisoformat(r[0]).replace(tzinfo=pytz.utc).astimezone(IST)
+            timestr = dt.strftime("%Y-%m-%d %H:%M:%S")
+        except:
+            timestr = r[0]
+        lines.append(f"{timestr} | {r[4]} | INR {fmt_inr_plain(r[1])} | USD {fmt_usd(r[2])} | {r[3]}")
+    full_text = "\n".join(lines) or "No transactions for today."
 
     bio = io.BytesIO()
     bio.write(full_text.encode("utf-8"))
     bio.seek(0)
     filename = f"report_{chat_id}_{datetime.date.today().isoformat()}.txt"
-    update.message.reply_document(document=bio, filename=filename)
+
+    sent = False
+    try:
+        # try to send into the same chat first
+        context.bot.send_document(chat_id=chat_id, document=bio, filename=filename)
+        sent = True
+    except Exception as e:
+        logger.warning("Failed to send report to chat %s: %s", chat_id, e)
+        try:
+            bio.seek(0)
+            context.bot.send_document(chat_id=user.id, document=bio, filename=filename)
+            sent = True
+        except Exception as e2:
+            logger.exception("Failed to send report to user %s: %s", user.id, e2)
+
     bio.close()
 
-# ====== admin helpers ======
+    # remove the inline button only; keep the summary text intact
+    try:
+        query.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+    # optionally notify the clicking admin (small ephemeral toast already done by query.answer)
+    # if you prefer a visible confirmation in chat, uncomment next lines:
+    # if sent:
+    #     try:
+    #         context.bot.send_message(chat_id=chat_id, text="Report has been sent ✅")
+    #     except:
+    #         pass
+
+
+# ====== admin & helper commands ======
 def whoami_cmd(update: Update, context: CallbackContext):
-    uid = update.effective_user.id
-    cid = update.effective_chat.id
-    uname = update.effective_user.first_name
+    uid = update.effective_user.id; cid = update.effective_chat.id; uname = update.effective_user.first_name
     update.message.reply_text(f"Your user_id: {uid}\nchat_id: {cid}\nname: {uname}")
 
 def clear_cmd(update: Update, context: CallbackContext):
     if not is_authorized(update.effective_user.id):
         return update.message.reply_text("❌ You are not authorized.")
     chat_id = update.effective_chat.id
-    con = sqlite3.connect(DB_PATH, timeout=10)
-    cur = con.cursor()
+    con = _db_connect(); cur = con.cursor()
     cur.execute("DELETE FROM transactions WHERE chat_id=?", (chat_id,))
-    con.commit()
-    con.close()
-    return update.message.reply_text("Today's bill has been cleared and recording can be restarted")
+    con.commit(); con.close()
+    return update.message.reply_text("✅ All transactions cleared for this chat.")
 
 def dbpeek_cmd(update: Update, context: CallbackContext):
     if not is_authorized(update.effective_user.id):
-        return
+        return update.message.reply_text("❌ You are not authorized.")
     chat_id = update.effective_chat.id
-    limit = 20
-    con = sqlite3.connect(DB_PATH, timeout=10)
-    cur = con.cursor()
-    cur.execute("SELECT time_iso, amount_inr, amount_usd, user, type FROM transactions WHERE chat_id=? ORDER BY id DESC LIMIT ?", (chat_id, limit))
-    rows = cur.fetchall()
-    con.close()
+    con = _db_connect(); cur = con.cursor()
+    cur.execute("SELECT time_iso, amount_inr, amount_usd, user, type FROM transactions WHERE chat_id=? ORDER BY id DESC LIMIT 50", (chat_id,))
+    rows = cur.fetchall(); con.close()
     if not rows:
         return update.message.reply_text("No transactions found for this chat_id.")
     text = "Last transactions for this chat:\n"
-    for r in reversed(rows):
-        text += f"{r[0]} | {r[4]} | INR={r[1]} | USD={r[2]:.2f} | {r[3]}\n"
+    for r in rows:
+        text += f"{r[0]} | {r[4]} | INR={fmt_inr_plain(r[1])} | USD={fmt_usd(r[2])} | {r[3]}\n"
     update.message.reply_text(text)
 
-# ====== daily auto-reset job ======
-def daily_reset(context: CallbackContext):
-    """Clear transactions for all chats at scheduled time and notify chats."""
-    logger.info("Running daily reset job")
+def setrate_cmd(update: Update, context: CallbackContext):
+    if not is_authorized(update.effective_user.id):
+        return update.message.reply_text("❌ Not authorized.")
+    chat_id = update.effective_chat.id
+    if not context.args:
+        return update.message.reply_text(f"Current rate: {get_exchange_rate(chat_id)}")
     try:
-        con = sqlite3.connect(DB_PATH, timeout=10)
-        cur = con.cursor()
-        cur.execute("SELECT DISTINCT chat_id FROM transactions")
-        rows = cur.fetchall()
-        chat_ids = {r[0] for r in rows}
-        con.close()
-    except Exception as e:
-        logger.exception("Failed to read chats for reset: %s", e)
-        chat_ids = set()
+        rate = float(context.args[0]); set_exchange_rate(chat_id, rate)
+        update.message.reply_text(f"✅ Exchange rate set to {rate}")
+    except:
+        update.message.reply_text("⚠️ Invalid rate. Use: /setrate 106.5")
 
+def getrate_cmd(update: Update, context: CallbackContext):
+    chat_id = update.effective_chat.id
+    update.message.reply_text(f"Exchange rate: {get_exchange_rate(chat_id)}")
+
+def setfee_cmd(update: Update, context: CallbackContext):
+    if not is_authorized(update.effective_user.id):
+        return update.message.reply_text("❌ Not authorized.")
+    chat_id = update.effective_chat.id
+    if not context.args:
+        return update.message.reply_text(f"Current fee: {get_fee_rate(chat_id)}%")
+    try:
+        fee = float(context.args[0]); set_fee_rate(chat_id, fee)
+        update.message.reply_text(f"✅ Fee set to {fee}%")
+    except:
+        update.message.reply_text("⚠️ Invalid fee. Use: /setfee 1.5")
+
+def addadmin_cmd(update: Update, context: CallbackContext):
+    if not is_authorized(update.effective_user.id):
+        return update.message.reply_text("❌ Not authorized.")
+    try:
+        uid = int(context.args[0]); add_admin(uid)
+        update.message.reply_text(f"✅ Added admin {uid}")
+    except:
+        update.message.reply_text("⚠️ Usage: /addadmin <user_id>")
+
+def deladmin_cmd(update: Update, context: CallbackContext):
+    if not is_authorized(update.effective_user.id):
+        return update.message.reply_text("❌ Not authorized.")
+    try:
+        uid = int(context.args[0])
+        if uid in ADMINS:
+            return update.message.reply_text("❌ Cannot remove built-in admin.")
+        remove_admin(uid); update.message.reply_text(f"✅ Removed admin {uid}")
+    except:
+        update.message.reply_text("⚠️ Usage: /deladmin <user_id>")
+
+# ====== daily reset ======
+def daily_reset(context: CallbackContext):
+    con = _db_connect(); cur = con.cursor()
+    cur.execute("SELECT DISTINCT chat_id FROM transactions")
+    chat_ids = {r[0] for r in cur.fetchall()}; con.close()
     for chat_id in chat_ids:
         try:
-            con = sqlite3.connect(DB_PATH, timeout=10)
-            cur = con.cursor()
-            cur.execute("DELETE FROM transactions WHERE chat_id=?", (chat_id,))
-            con.commit()
-            con.close()
-            logger.info("Cleared transactions for chat %s", chat_id)
+            con2 = _db_connect(); cur2 = con2.cursor()
+            cur2.execute("DELETE FROM transactions WHERE chat_id=?", (chat_id,))
+            con2.commit(); con2.close()
             try:
-                context.bot.send_message(chat_id, "✅ Daily auto-reset done (06:00 IST). New day started!")
-            except Exception as ex:
-                logger.warning("Could not send reset notification to %s: %s", chat_id, ex)
+                context.bot.send_message(chat_id, "Good morning — begun new day. Please send today's UPI/IMPS amounts here.")
+            except Exception as e:
+                logger.warning("Couldn't send reset message to %s: %s", chat_id, e)
         except Exception as e:
-            logger.exception("Failed to clear transactions for chat %s: %s", chat_id, e)
+            logger.exception("Error clearing transactions for chat %s: %s", chat_id, e)
 
-# ====== text handler (transactions + admin) ======
+# ====== text handler (with +0 special-case) ======
 def text_handler(update: Update, context: CallbackContext):
     chat_id = update.effective_chat.id
     user_id = update.effective_user.id
@@ -336,119 +529,85 @@ def text_handler(update: Update, context: CallbackContext):
     if not is_authorized(user_id):
         return
 
-    # plain clear
-    if text.lower() == "clear" or text.lower().startswith("clearing bills"):
-        con = sqlite3.connect(DB_PATH, timeout=10)
-        cur = con.cursor()
-        cur.execute("DELETE FROM transactions WHERE chat_id=?", (chat_id,))
-        con.commit()
-        con.close()
-        return update.message.reply_text("Today's bill has been cleared and recording can be restarted")
-
-    # add/del operator
-    if text.lower().startswith("add "):
-        try:
-            new_id = int(text.split()[1])
-            authorized_users.add(new_id)
-            return update.message.reply_text(f"✅ Added operator with ID: {new_id}")
-        except:
-            return update.message.reply_text("⚠️ Example: add 123456789")
-    if text.lower().startswith("del "):
-        try:
-            remove_id = int(text.split()[1])
-            authorized_users.discard(remove_id)
-            return update.message.reply_text(f"❌ Removed operator with ID: {remove_id}")
-        except:
-            return update.message.reply_text("⚠️ Example: del 123456789")
-
-    # exchange rate
-    if text.lower().startswith("exchange"):
-        match = re.search(r"(-?\d+(\.\d+)?)", text)
-        if match:
-            exchange_rates[chat_id] = float(match.group(1))
-            return update.message.reply_text(f"Exchange rate set: {exchange_rates[chat_id]}")
-        else:
-            return update.message.reply_text("⚠️ Example: exchange 106")
-
-    # fee rate
-    if text.lower().startswith("fee"):
-        match = re.search(r"(\d+(\.\d+)?)", text)
-        if match:
-            fee_rates[chat_id] = float(match.group(1))
-            return update.message.reply_text(f"Fee rate set: {fee_rates[chat_id]}%")
-        else:
-            return update.message.reply_text("⚠️ Example: fee 2")
-
     rate = get_exchange_rate(chat_id)
 
-    # Income (+expr)
+    # Special-case exact "+0": do NOT record, but reply + summary+button
+    if text == "+0":
+        update.message.reply_text
+        send_summary_with_button(update, context, chat_id)
+        return
+
+    # Income '+' with arithmetic
     if text.startswith("+"):
         expr = text[1:].strip()
         try:
-            amount = eval_arith(expr)
+            amount = safe_eval_arith(expr)
             usd = amount / rate
             add_tx_db(chat_id, user, "income", amount, usd)
-            return update.message.reply_text(build_compact_message(chat_id), parse_mode=None)
+            send_summary_with_button(update, context, chat_id)
+            return
         except Exception:
-            return update.message.reply_text("⚠️ Invalid income format.")
+            return update.message.reply_text("⚠️ Invalid income format. Use +100 or +100*1.07 etc.")
 
-    # Negative Income (-expr)  --> accept -100 or -100.5 (with optional spaces)
+    # Negative income -number
     if re.fullmatch(r'-\s*\d+(\.\d+)?', text):
         num = re.sub(r'[^\d\.\-]', '', text)
         try:
             amount = float(num)
-            inr = -abs(amount) if amount > 0 else amount
+            inr = -abs(amount)
             usd = inr / rate
             add_tx_db(chat_id, user, "income", inr, usd)
-            return update.message.reply_text(build_compact_message(chat_id), parse_mode=None)
-        except Exception:
+            send_summary_with_button(update, context, chat_id)
+            return
+        except:
             return update.message.reply_text("⚠️ Invalid negative income format.")
 
-    # ====== Strict payout parsing (only CAPITAL T accepted) ======
-    t = text.strip()
-    m = re.fullmatch(r'T(-?\d+(\.\d+)?)([Uu])', t)
+    # Payout: T<number> (USD)
+    m = re.fullmatch(r'T(-?\d+(\.\d+)?)([Uu])?', text)
     if m:
         num_str = m.group(1)
         try:
             amt = float(num_str)
-            usd_amt = -abs(amt) if num_str.startswith("-") else amt
+            usd_amt = float(amt)
             inr = usd_amt * rate
             add_tx_db(chat_id, user, "payout", inr, usd_amt)
-            return update.message.reply_text(build_compact_message(chat_id), parse_mode=None)
-        except Exception:
-            return update.message.reply_text("⚠️ Invalid payout format.")
-    if t and t[0] == 'T':
-        return
+            send_summary_with_button(update, context, chat_id)
+            return
+        except:
+            return update.message.reply_text("⚠️ Invalid payout format. Use T100")
+
+    return
 
 # ====== main ======
 def main():
     init_db()
-    if not TOKEN or TOKEN == "" or TOKEN == "PUT_YOUR_TOKEN_HERE":
-        logger.error("Set BOT_TOKEN env var or edit bot.py to include your bot token.")
+    if not TOKEN:
+        logger.error("No TOKEN found. Set TOKEN environment variable before running.")
         sys.exit(1)
 
     updater = Updater(TOKEN, use_context=True)
     dp = updater.dispatcher
 
-    # core commands
     dp.add_handler(CommandHandler("start", start))
     dp.add_handler(CommandHandler("summary", summary_cmd))
     dp.add_handler(CommandHandler("viewfull", viewfull_cmd))
-
-    # debug/admin commands
+    dp.add_handler(CallbackQueryHandler(viewfull_callback, pattern=r'^VIEWFULL$'))
     dp.add_handler(CommandHandler("whoami", whoami_cmd))
     dp.add_handler(CommandHandler("clear", clear_cmd))
     dp.add_handler(CommandHandler("dbpeek", dbpeek_cmd))
 
-    # text handler for transactions and plain-text clear
+    dp.add_handler(CommandHandler(["setrate", "rate"], setrate_cmd))
+    dp.add_handler(CommandHandler("getrate", getrate_cmd))
+    dp.add_handler(CommandHandler("setfee", setfee_cmd))
+    dp.add_handler(CommandHandler("addadmin", addadmin_cmd))
+    dp.add_handler(CommandHandler("deladmin", deladmin_cmd))
+
     dp.add_handler(MessageHandler(Filters.text & ~Filters.command, text_handler))
 
-    # schedule daily reset at 06:00 IST
     job_queue = updater.job_queue
-    ist = pytz.timezone("Asia/Kolkata")
-    reset_time = datetime.time(hour=6, minute=0, tzinfo=ist)
+    reset_time = datetime.time(hour=8, minute=45, tzinfo=IST)
     job_queue.run_daily(daily_reset, time=reset_time)
-    logger.info("Scheduled daily reset at 06:00 IST")
+    logger.info("Scheduled daily reset at 08:45 IST")
 
     print("Bot started...")
     updater.start_polling()
@@ -456,6 +615,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
